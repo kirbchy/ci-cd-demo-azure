@@ -6,6 +6,7 @@ import cats.effect.Resource
 import com.comcast.ip4s.Host
 import com.comcast.ip4s.Port
 import com.dimafeng.testcontainers.PostgreSQLContainer
+import org.testcontainers.utility.DockerImageName
 
 import config.DBConfig
 
@@ -18,6 +19,7 @@ object PostgreSQLResource:
     ContainerResource
       .make(
         container = PostgreSQLContainer(
+          dockerImageNameOverride = DockerImageName.parse("postgres:16"),
           databaseName = database,
           username = user,
           password = password
@@ -29,7 +31,8 @@ object PostgreSQLResource:
           port = Port.fromInt(postgreSQLContainer.firstMappedPort).get,
           database = database,
           user = user,
-          password = password
+          password = password,
+          sslEnabled = false
         )
       }
 end PostgreSQLResource
