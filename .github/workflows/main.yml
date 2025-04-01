@@ -1,0 +1,19 @@
+name: Build and Deploy main
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  main:
+    uses: ./.github/workflows/build-validate-deploy-app.yml
+    secrets: inherit
+    with:
+      validate: false
+      deploy: true

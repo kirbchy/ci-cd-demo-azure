@@ -1,0 +1,188 @@
+name: Build, Validate, and Deploy the App
+
+on:
+  workflow_call:
+    inputs:
+      validate:
+        type: boolean
+        required: true
+        description: Enables code checks
+      deploy:
+        type: boolean
+        required: true
+        description: Enables deployment to Azure
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  IMAGE_TAG: ${{ github.sha }}
+  EAFIT_ID: ${{ vars.EAFIT_ID }}
+  ARM_USE_OIDC: true
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  AZURE_CORE_OUTPUT: none
+  SBT_NATIVE_CLIENT: true
+
+jobs:
+  build-validate-deploy:
+    name: Build, Validate, and Deploy the App
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Create Terraform variables file
+        working-directory: infrastructure
+        run: |
+          cat >> terraform.tfvars <<EOL
+          registry_name     = "${EAFIT_ID}"
+          db_server_name    = "${EAFIT_ID}"
+          service_image_tag = "${IMAGE_TAG}"
+          db_password       = "${{ secrets.DB_PASSWORD }}"
+          EOL
+
+      - name: Terraform Init
+        id: terraform-init
+        working-directory: infrastructure
+        run: terraform init -input=false -backend-config="storage_account_name=${EAFIT_ID}"
+
+      - name: Deploy the prereqs stage
+        if: ${{ inputs.deploy }}
+        working-directory: infrastructure
+        run: terraform apply -no-color -input=false -auto-approve -target=module.todo_app.module.todo_service_prereqs
+
+      - name: Deploy the stateful stage
+        if: ${{ inputs.deploy }}
+        working-directory: infrastructure
+        run: terraform apply -no-color -input=false -auto-approve -target=module.todo_app.module.todo_service_stateful
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: microsoft
+          java-version: 21
+          cache: sbt
+
+      - name: Setup sbt
+        uses: sbt/setup-sbt@v1
+
+      - name: Build the Scala code
+        if: ${{ !inputs.validate }}
+        run: sbt compile
+
+      - name: Build and Validate the Scala code
+        if: ${{ inputs.validate }}
+        run: sbt validate
+
+      - name: Generate the server assembly JAR
+        run: sbt server/assembly
+
+      - name: Build the Docker image
+        run: docker build -t ${EAFIT_ID}.azurecr.io/todo-service:${IMAGE_TAG} .
+
+      - name: Push Docker image to ACR
+        if: ${{ inputs.deploy }}
+        run: |
+          # Login into the Azure Container Registry
+          az acr login -n ${EAFIT_ID}
+          # Push the Docker image to the Azure Container Registry
+          docker push ${EAFIT_ID}.azurecr.io/todo-service:${IMAGE_TAG}
+
+      - name: Validate the Terraform code formatting
+        id: terraform-fmt
+        if: ${{ inputs.validate }}
+        working-directory: infrastructure
+        run: terraform fmt -check -recursive
+
+      - name: Validate the Terraform code validity
+        id: terraform-validate
+        if: ${{ inputs.validate }}
+        working-directory: infrastructure
+        run: terraform validate -no-color
+
+      - name: Validate the Terraform plan
+        id: terraform-plan
+        if: ${{ inputs.validate }}
+        working-directory: infrastructure
+        run: terraform plan -no-color -input=false -out=tfplan
+
+      - name: Deploy the app stage
+        if: ${{ inputs.deploy }}
+        working-directory: infrastructure
+        run: terraform apply -no-color -input=false -auto-approve tfplan
+
+      - name: Add a comment with the Terraform status
+        uses: actions/github-script@v7
+        if: ${{ inputs.validate }}
+        env:
+          TERRAFORM_PLAN: "terraform\n${{ steps.terraform-plan.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // 1. Retrieve existing bot comments for the PR.
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            })
+            const botComment = comments.find(comment => {
+              return comment.user.type === 'Bot' && comment.body.includes('Terraform Format and Style')
+            })
+
+            // 2. Prepare format of the comment.
+            const output = `
+              #### Terraform Initialization ⚙️\`${{ steps.terraform-init.outcome }}\`
+
+              #### Terraform Format and Style 🖌\`${{ steps.terraform-fmt.outcome }}\`
+
+              #### Terraform Validation 🤖\`${{ steps.terraform-validate.outcome }}\`
+              <details><summary>Validation Output</summary>
+
+              \`\`\`\n
+              ${{ steps.terraform-validate.outputs.stdout }}
+              \`\`\`
+
+              </details>
+
+              #### Terraform Plan 📖\`${{ steps.terraform-plan.outcome }}\`
+
+              <details><summary>Show Plan</summary>
+
+              \`\`\`\n
+              ${process.env.TERRAFORM_PLAN}
+              \`\`\`
+
+              </details>
+            `;
+
+            // 3. If we have a comment, update it, otherwise create a new one.
+            if (botComment) {
+              github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: output
+              })
+            } else {
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: output
+              })
+            }
